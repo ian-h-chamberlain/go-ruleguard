@@ -57,20 +57,22 @@ func (e *engine) Load(ctx *LoadContext, buildContext *build.Context, filename st
 		debugPrint:   ctx.DebugPrint,
 		buildContext: buildContext,
 	})
-	irfile, pkg, err := convertAST(ctx, imp, filename, data)
+	conv, err := convertAST(ctx, imp, filename, data)
 	if err != nil {
 		return err
 	}
 	config := irLoaderConfig{
 		state:      e.state,
-		pkg:        pkg,
+		pkg:        conv.Package,
+		types:      conv.TypeInfo,
 		ctx:        ctx,
 		importer:   imp,
 		itab:       typematch.NewImportsTab(stdinfo.PathByName),
 		gogrepFset: token.NewFileSet(),
 	}
 	l := newIRLoader(config)
-	rset, err := l.LoadFile(filename, irfile)
+
+	rset, err := l.LoadFile(filename, conv.File)
 	if err != nil {
 		return err
 	}

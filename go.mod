@@ -3,6 +3,7 @@ module github.com/quasilyte/go-ruleguard
 go 1.19
 
 require (
+	github.com/davecgh/go-spew v1.1.1
 	github.com/go-toolsmith/astcopy v1.0.2
 	github.com/google/go-cmp v0.6.0
 	github.com/quasilyte/go-ruleguard/dsl v0.3.22

@@ -11,6 +11,7 @@ import (
 	"os"
 	"regexp"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/quasilyte/gogrep"
 	"github.com/quasilyte/gogrep/nodetag"
 
@@ -30,7 +31,8 @@ type irLoaderConfig struct {
 
 	itab *typematch.ImportsTab
 
-	pkg *types.Package
+	pkg   *types.Package
+	types *types.Info
 
 	gogrepFset *token.FileSet
 
@@ -43,7 +45,8 @@ type irLoader struct {
 	ctx   *LoadContext
 	itab  *typematch.ImportsTab
 
-	pkg *types.Package
+	pkg   *types.Package
+	types *types.Info
 
 	file       *ir.File
 	gogrepFset *token.FileSet
@@ -68,6 +71,7 @@ func newIRLoader(config irLoaderConfig) *irLoader {
 		importer:   config.importer,
 		itab:       config.itab,
 		pkg:        config.pkg,
+		types:      config.types,
 		prefix:     config.prefix,
 		gogrepFset: config.gogrepFset,
 	}
@@ -148,7 +152,7 @@ func (l *irLoader) loadExternFile(prefix, pkgPath, filename string) (*goRuleSet,
 	if err != nil {
 		return nil, err
 	}
-	irfile, pkg, err := convertAST(l.ctx, l.importer, filename, src)
+	conv, err := convertAST(l.ctx, l.importer, filename, src)
 	if err != nil {
 		return nil, err
 	}
@@ -157,12 +161,12 @@ func (l *irLoader) loadExternFile(prefix, pkgPath, filename string) (*goRuleSet,
 		ctx:         l.ctx,
 		importer:    l.importer,
 		prefix:      prefix,
-		pkg:         pkg,
+		pkg:         conv.Package,
 		importedPkg: pkgPath,
 		itab:        l.itab,
 		gogrepFset:  l.gogrepFset,
 	}
-	rset, err := newIRLoader(config).LoadFile(filename, irfile)
+	rset, err := newIRLoader(config).LoadFile(filename, conv.File)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", l.importedPkg, err)
 	}
@@ -185,6 +189,7 @@ func (l *irLoader) compileFilterFuncs(filename string, irfile *ir.File) error {
 	buf.WriteString("type _ = dsl.Matcher\n")
 	buf.WriteString("type _ = types.Type\n")
 
+	l.ctx.DebugPrint("Loading file " + filename)
 	fset := token.NewFileSet()
 	f, err := goutil.LoadGoFile(goutil.LoadConfig{
 		Fset:     fset,
@@ -478,14 +483,39 @@ func (l *irLoader) unwrapInterfaceExpr(filter ir.FilterExpr) (*types.Interface, 
 	if err != nil {
 		return nil, l.errorf(filter.Line, err, "parse %s type expr", typeString)
 	}
-	qn, ok := n.(*ast.SelectorExpr)
-	if !ok {
+
+	var qn *ast.SelectorExpr
+	var typeParamExprs []ast.Expr
+
+	switch n := n.(type) {
+	case *ast.SelectorExpr:
+		qn = n
+	case *ast.IndexExpr:
+		// For generic types, we may have an index expression where the index is a type argument.
+		sel, ok := n.X.(*ast.SelectorExpr)
+		if !ok {
+			return nil, l.errorf(filter.Line, nil, "unexpected index expression %s", typeString)
+		}
+		qn = sel
+		typeParamExprs = []ast.Expr{n.Index}
+
+	case *ast.IndexListExpr:
+		sel, ok := n.X.(*ast.SelectorExpr)
+		if !ok {
+			return nil, l.errorf(filter.Line, nil, "unexpected index expression %s", typeString)
+		}
+		qn = sel
+		typeParamExprs = n.Indices
+
+	default:
 		return nil, l.errorf(filter.Line, nil, "can't resolve %s type; try a fully-qualified name", typeString)
 	}
+
 	pkgName, ok := qn.X.(*ast.Ident)
 	if !ok {
 		return nil, l.errorf(filter.Line, nil, "invalid package name")
 	}
+
 	pkgPath, ok := l.itab.Lookup(pkgName.Name)
 	if !ok {
 		return nil, l.errorf(filter.Line, nil, "package %s is not imported", pkgName.Name)
@@ -494,14 +524,63 @@ func (l *irLoader) unwrapInterfaceExpr(filter ir.FilterExpr) (*types.Interface, 
 	if err != nil {
 		return nil, l.importErrorf(filter.Line, err, "can't load %s", pkgPath)
 	}
+
 	obj := pkg.Scope().Lookup(qn.Sel.Name)
 	if obj == nil {
 		return nil, l.errorf(filter.Line, nil, "%s is not found in %s", qn.Sel.Name, pkgPath)
 	}
-	iface, ok := obj.Type().Underlying().(*types.Interface)
+
+	named, ok := obj.Type().(*types.Named)
+	if ok && named.TypeParams() != nil {
+		// this is a generic type, let's look up the type params
+
+		ctx := types.NewContext()
+
+		typeArgs := make([]types.Type, len(typeParamExprs))
+		for i := range typeArgs {
+
+			ident, ok := typeParamExprs[i].(*ast.Ident)
+			if !ok {
+				return nil, l.errorf(filter.Line, nil, "expected an identifier as a type argument, got %T", typeParamExprs[i])
+			}
+
+			// TODO: this won't work for non-builtin types AFAICT so probably would
+			// need to look at how the type match filters work or something
+			ty, err := l.unwrapTypeExpr(ir.FilterExpr{
+				Line:  0,
+				Op:    filter.Op,
+				Src:   filter.Src,
+				Value: ident.Name,
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			typeArgs[i] = ty
+		}
+
+		instance, err := types.Instantiate(ctx, obj.Type(), typeArgs, true)
+		if err != nil {
+			return nil, l.errorf(filter.Line, err, "unable to instantiate %s", typeString)
+		}
+
+		spew.Dump(instance, typeArgs)
+
+		intf, ok := instance.Underlying().(*types.Interface)
+		if !ok {
+			return nil, l.errorf(filter.Line, nil, "%s is not an interface (actual type %[1]T)", instance)
+		}
+
+		return intf, nil
+	}
+
+	iface, ok := named.Underlying().(*types.Interface)
 	if !ok {
 		return nil, l.errorf(filter.Line, nil, "%s is not an interface type", qn.Sel.Name)
 	}
+
+	fmt.Printf("Found interface of type %T: %[1]v, origin %[2]T: %[2]v", iface, named.Origin())
+
 	return iface, nil
 }
 
